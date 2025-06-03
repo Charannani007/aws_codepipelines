@@ -1,0 +1,79 @@
+version: 0.2
+
+env:
+  variables:
+    HEAD_BRANCH: "develop"
+    BASE_BRANCH: "release"
+    MAVEN_SETTINGS_SECRET: "MAVEN_SETTINGS_B64"
+    REPO_URL_SECRET: "REPO_URL_SECRET"
+    REPO_NAME_SECRET: "REPO_NAME_SECRET"
+    OWNER_SECRET: "OWNER_SECRET"
+    STOKEN: "STOKEN"
+
+phases:
+  install:
+    runtime-versions:
+      java: corretto11
+    commands:
+      - apt-get update && apt-get install -y git curl jq awscli
+      - MAVEN_SETTINGS_B64=$(aws secretsmanager get-secret-value --secret-id $MAVEN_SETTINGS_SECRET --query SecretString --output text)
+      - mkdir -p $HOME/.m2
+      - echo "$MAVEN_SETTINGS_B64" | base64 --decode > $HOME/.m2/settings.xml
+
+  pre_build:
+    commands:
+      - |
+        GITHUB_TOKEN=$(aws secretsmanager get-secret-value --secret-id $STOKEN --query SecretString --output text)
+        REPO_URL=$(aws secretsmanager get-secret-value --secret-id $REPO_URL_SECRET --query SecretString --output text)
+        REPO_NAME=$(aws secretsmanager get-secret-value --secret-id $REPO_NAME_SECRET --query SecretString --output text)
+        OWNER=$(aws secretsmanager get-secret-value --secret-id $OWNER_SECRET --query SecretString --output text)
+
+        if [ -z "$GITHUB_TOKEN" ] || [ -z "$REPO_URL" ] || [ -z "$REPO_NAME" ] || [ -z "$OWNER" ]; then exit 1; fi
+
+      - git clone https://x-access-token:$GITHUB_TOKEN@$REPO_URL repo
+      - cd repo
+      - git config --global user.name "saicharan"
+      - git config --global user.email "saicharan@dataskate.io"
+      - git checkout $HEAD_BRANCH
+      - git pull origin $HEAD_BRANCH
+      - git fetch origin $BASE_BRANCH
+
+  build:
+    commands:
+      - mvn clean package -DskipTests -s $HOME/.m2/settings.xml
+
+  post_build:
+    commands:
+      - |
+        RESPONSE=$(curl -s -w "HTTPSTATUS:%{http_code}" -X POST \
+          -H "Authorization: token $GITHUB_TOKEN" \
+          -H "Accept: application/vnd.github.v3+json" \
+          https://api.github.com/repos/$OWNER/$REPO_NAME/pulls \
+          -d "{
+                \"title\": \"Merge $HEAD_BRANCH into $BASE_BRANCH\",
+                \"body\": \"This pull request was auto-created by AWS CodeBuild.\",
+                \"head\": \"$HEAD_BRANCH\",
+                \"base\": \"$BASE_BRANCH\"
+              }")
+
+        BODY=$(echo "$RESPONSE" | sed -e 's/HTTPSTATUS\:.*//g')
+        STATUS=$(echo "$RESPONSE" | tr -d '\n' | sed -e 's/.*HTTPSTATUS://')
+
+        if [ "$STATUS" -eq 201 ]; then
+          echo "Pull request created successfully."
+        elif [ "$STATUS" -eq 422 ]; then
+          MSG=$(echo "$BODY" | jq -r '.message')
+          if echo "$BODY" | jq -e '.errors[]?.message' | grep -q "No commits between"; then
+            echo "Pull request creation failed: No commits between $BASE_BRANCH and $HEAD_BRANCH."
+          else
+            echo "Pull request creation failed: $MSG"
+          fi
+        else
+          echo "Failed to create pull request. HTTP status: $STATUS"
+          echo "$BODY" | jq
+          exit 1
+        fi
+
+artifacts:
+  files:
+    - '**/*'
