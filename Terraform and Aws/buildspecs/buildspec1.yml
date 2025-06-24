@@ -1,0 +1,70 @@
+version: 0.2
+
+env:
+  variables:
+    BASE_BRANCH: "develop"
+    HEAD_BRANCH: "feature"
+
+phases:
+  install:
+    runtime-versions:
+      java: corretto11
+    commands:
+      - echo "Installing required tools..."
+      - apt-get update && apt-get install -y git curl awscli
+      - echo "Installation complete."
+
+  pre_build:
+    commands:
+      - echo "Retrieving secrets from AWS Secrets Manager..."
+
+      - GITHUB_TOKEN=$(aws secretsmanager get-secret-value --secret-id STOKEN --query SecretString --output text)
+      - REPO_URL=$(aws secretsmanager get-secret-value --secret-id REPO_URL_SECRET --query SecretString --output text)
+      - REPO_NAME=$(aws secretsmanager get-secret-value --secret-id REPO_NAME_SECRET --query SecretString --output text)
+      - OWNER=$(aws secretsmanager get-secret-value --secret-id OWNER_SECRET --query SecretString --output text)
+
+      - |
+        if [ -z "$GITHUB_TOKEN" ] || [ -z "$REPO_URL" ] || [ -z "$REPO_NAME" ] || [ -z "$OWNER" ]; then
+          echo "ERROR: One or more secrets are empty"
+          exit 1
+        fi
+
+      - |
+        echo "All secrets retrieved successfully:"
+        echo "GITHUB_TOKEN: $GITHUB_TOKEN"
+        echo "REPO_URL: $REPO_URL"
+        echo "REPO_NAME: $REPO_NAME"
+        echo "OWNER: $OWNER"
+
+      - echo "Cloning the repository..."
+      - git clone https://x-access-token:$GITHUB_TOKEN@$REPO_URL repo
+      - cd repo
+
+      - git config --global user.name "saicharan"
+      - git config --global user.email "saicharan@dataskate.io"
+
+  build:
+    commands:
+      - echo "Building code from $HEAD_BRANCH branch..."
+      - echo "Feature branch code built successfully."
+
+  post_build:
+    commands:
+      - echo "Creating a Pull Request from $HEAD_BRANCH to $BASE_BRANCH..."
+      - |
+        CREATE_PR_RESPONSE=$(curl -s -X POST \
+          -H "Authorization: token $GITHUB_TOKEN" \
+          -H "Accept: application/vnd.github.v3+json" \
+          https://api.github.com/repos/$OWNER/$REPO_NAME/pulls \
+          -d "{
+                \"title\": \"Merge $HEAD_BRANCH into $BASE_BRANCH\",
+                \"body\": \"This pull request was auto-created by CodeBuild after a successful build.\",
+                \"head\": \"$HEAD_BRANCH\",
+                \"base\": \"$BASE_BRANCH\"
+              }")
+        echo "$CREATE_PR_RESPONSE" | jq
+      - echo "Pull Request created successfully. Manual review and merge required."
+
+artifacts:
+  files:
+    - '**/*'

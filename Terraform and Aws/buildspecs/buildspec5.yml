@@ -1,0 +1,65 @@
+version: 0.2
+ 
+phases:
+  install:
+    runtime-versions:
+      python: 3.9
+    commands:
+      - pip install requests
+      - apt-get update  # Update package lists for apt-get
+      - apt-get install -y jq  # Install jq for parsing JSON responses from GitHub API
+  build:
+    commands:
+      - |
+        echo "Debug: Current working directory..."
+        pwd
+        echo "Debug: Checking if this is a Git repository..."
+        git rev-parse --is-inside-work-dir || echo "Error: Not inside a Git repository"
+        echo "Debug: Listing directory contents..."
+        ls -la
+        echo "Debug: Checking Git status..."
+        git status || echo "Error: Git status failed - not a Git repository"
+      - echo "Fetching app name from S3..."
+      - export S3_BUCKET=$(aws secretsmanager get-secret-value --secret-id S3_BUCKET --query SecretString --output text)
+      - aws s3 cp s3://${S3_BUCKET}/app_name.txt app_name.txt
+      - export APP_NAME=$(cat app_name.txt | sed 's/^ds-//' | sed 's/-project-1-dev$//')
+      - echo "Fetching Base64-encoded Python script from Secrets Manager..."
+      - export ENCODED_SCRIPT=$(aws secretsmanager get-secret-value --secret-id mule-app-cicd/download-script --query SecretString --output text)
+      - echo "Decoding Base64-encoded Python script..."
+      - echo "$ENCODED_SCRIPT" | base64 -d > download_extract_import_postman.py
+      - echo "Python script decoded and saved."
+      - echo "Running script to download ZIP..."
+      - python download_extract_import_postman.py
+      - echo "Fetching GitHub token from Secrets Manager..."
+      - export GITHUB_TOKEN=$(aws secretsmanager get-secret-value --secret-id STOKEN --query SecretString --output text)
+      - echo "Fetching GitHub repository URL from Secrets Manager..."
+      - export REPO_URL=$(aws secretsmanager get-secret-value --secret-id REPO_URL_SECRET --query SecretString --output text)
+      - echo "Extracting owner/repo from REPO_URL..."
+      - export REPO_PATH=$(echo $REPO_URL | sed -E 's#(https://|git@)?(github.com[:/])?([^/]+/[^/.]+)(.git)?#\3#')
+      - echo "Cloning the repository..."
+      - git clone https://$GITHUB_TOKEN@$REPO_URL repo
+      - cd repo
+      - git remote -v
+      - echo "Creating a Git tag for the release..."
+      - git config --global user.email "saicharan@dataskate.io"
+      - git config --global user.name "saicharan"
+      - export TAG_NAME="release-${APP_NAME}-$(date +%Y%m%d%H%M%S)"
+      - git tag -a $TAG_NAME -m "Release for ${APP_NAME}-spec.zip"
+      - git push origin $TAG_NAME
+      - echo "Creating a GitHub Release using the API..."
+      - |
+        curl -s -H "Authorization:token $GITHUB_TOKEN" -H "Accept:application/vnd.github.v3+json" -X POST "https://api.github.com/repos/$REPO_PATH/releases" -d "{\"tag_name\": \"$TAG_NAME\", \"name\": \"Release for ${APP_NAME}\", \"body\": \"Release containing ${APP_NAME}-spec.zip\", \"draft\": false, \"prerelease\": false}" > release_response.json
+      - export RELEASE_ID=$(cat release_response.json | jq -r '.id')
+      - |
+        if [ -z "$RELEASE_ID" ]; then echo "Error: Failed to create GitHub Release"; exit 1; fi
+      - echo "Uploading ZIP file as a release asset..."
+      - |
+        curl -s -H "Authorization:token $GITHUB_TOKEN" -H "Accept:application/vnd.github.v3+json" -H "Content-Type: application/zip" --data-binary @../${APP_NAME}-spec.zip -X POST "https://uploads.github.com/repos/$REPO_PATH/releases/$RELEASE_ID/assets?name=${APP_NAME}-spec.zip"
+  post_build:
+    commands:
+      - echo "Build completed on `date`"
+ 
+artifacts:
+  files:
+    - ${APP_NAME}-spec.zip
+  discard-paths: yes

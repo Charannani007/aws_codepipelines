@@ -1,0 +1,86 @@
+version: 0.2
+
+env:
+  variables:
+    S3_BUCKET: "dataskate-project-release"
+    MAVEN_SETTINGS_SECRET: "MAVEN_SETTINGS_B64"
+    CLIENT_ID_SECRET: "CLIENT_ID"
+    CLIENT_SECRET_SECRET: "CLIENT_SECRET"
+    REPO_URL_SECRET: "REPO_URL_SECRET" 
+
+phases:
+  install:
+    runtime-versions:
+      java: corretto11
+    commands:
+      - echo "Installing required tools..."
+      - apt-get update && apt-get install -y zip git jq
+      - echo "Fetching secrets from AWS Secrets Manager..."
+      - MAVEN_SETTINGS_B64=$(aws secretsmanager get-secret-value --secret-id $MAVEN_SETTINGS_SECRET --query SecretString --output text)
+      - CLIENT_ID=$(aws secretsmanager get-secret-value --secret-id $CLIENT_ID_SECRET --query SecretString --output text)
+      - CLIENT_SECRET=$(aws secretsmanager get-secret-value --secret-id $CLIENT_SECRET_SECRET --query SecretString --output text)
+      - REPO_URL=$(aws secretsmanager get-secret-value --secret-id $REPO_URL_SECRET --query SecretString --output text)
+      - mkdir -p $HOME/.m2
+      - echo "$MAVEN_SETTINGS_B64" | base64 --decode > $HOME/.m2/settings.xml
+      - echo "Secrets successfully loaded."
+
+  build:
+    commands:
+      - |-
+        echo "Original repo URL from secret: $REPO_URL"
+      - |-
+        # Fix repo URL prefix if missing (POSIX compliant)
+        case "$REPO_URL" in
+          https://* | git@*)
+            ;;
+          *)
+            REPO_URL="https://$REPO_URL"
+            ;;
+        esac
+      - |-
+        echo "Cloning repo URL: $REPO_URL"
+      - git clone "$REPO_URL" repo
+      - cd repo
+      - git config --global user.name "saicharan"
+      - git config --global user.email "saicharan@dataskate.io"
+      - |-
+        echo "Running Maven build and deploy..."
+      - mvn clean deploy -DmuleDeploy -Dver=1 -Denv=dev -DconnectedAppClientId="$CLIENT_ID" -DconnectedAppClientSecret="$CLIENT_SECRET" -Dgrant_type=client_credentials -s $HOME/.m2/settings.xml | tee deploy.log
+      - |-
+        echo "Extracting application name from deploy.log..."
+      - |
+        if grep -q "Starting application:" deploy.log; then
+          APP_NAME=$(grep "Starting application:" deploy.log | sed -E 's/.*Starting application: (.*)/\1/' | tr -d '\0\r\n')
+          echo "$APP_NAME" > app_name.txt
+          echo "Captured app name: ${APP_NAME:-empty}"
+        else
+          echo "Warning: Could not find 'Starting application:' in deploy.log"
+          APP_NAME="unknown-app"
+          echo "$APP_NAME" > app_name.txt
+        fi
+      - |-
+        echo "Uploading app_name.txt to S3 for next stage usage..."
+      - aws s3 cp app_name.txt s3://${S3_BUCKET}/app_name.txt
+      - |-
+        echo "Finding generated JAR file..."
+      - export JAR_FILE=$(find target -type f -name "*.jar" | head -n 1)
+      - |
+        if [ -z "$JAR_FILE" ]; then
+          echo "No JAR file found. Build failed."
+          exit 1
+        fi
+      - |-
+        echo "Uploading JAR to S3..."
+      - aws s3 cp "$JAR_FILE" "s3://${S3_BUCKET}/${APP_NAME}-snapshot.jar"
+      - |-
+        echo "Upload complete."
+      - |-
+        echo "Copying files to root for artifact upload..."
+      - cp app_name.txt ../
+      - cp deploy.log ../
+      - cd ..
+
+artifacts:
+  files:
+    - app_name.txt
+    - deploy.log
